@@ -1,0 +1,231 @@
+substitutions:
+  devicename: "ultimate-soil"
+  friendly_name: "Ultimate Soil Node"
+
+esphome:
+  name: ${devicename}
+  board: esp32dev
+
+wifi:
+  ssid: "ΤΟ_WIFI_ΣΟΥ"
+  password: "Ο_ΚΩΔΙΚΟΣ_ΣΟΥ"
+
+# Ενεργοποιούμε το σύστημα αποθήκευσης Flash. Εδώ θα σώζονται τα Calibration σου μόνιμα!
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Μεταβλητές που σώζονται στη μνήμη του ESP32 (Δεν χάνονται μετά από επανεκκίνηση)
+globals:
+  - id: cal_dry
+    type: float
+    restore_value: true
+    initial_value: '2.30'
+  - id: cal_wet
+    type: float
+    restore_value: true
+    initial_value: '1.05'
+
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+
+ads1115:
+  - address: 0x48
+
+dallas:
+  - pin: GPIO5
+
+# Διακόπτης για το Transistor (Ανοίγει το ρεύμα του αισθητήρα)
+switch:
+  - platform: gpio
+    pin: GPIO4
+    id: sensor_power_switch
+    name: "Sensor Internal Power"
+    internal: true # Το κρύβουμε από το HA, θα το χειρίζεται μόνος του ο κώδικας
+
+sensor:
+  # 1. Θερμοκρασία Χώματος
+  - platform: dallas
+    name: "${friendly_name} Soil Temp"
+    id: soil_temp
+    unit_of_measurement: "°C"
+    
+  # 2. Raw Τάση από ADS1115 (update_interval: never, για να το διαβάζουμε χειροκίνητα)
+  - platform: ads1115
+    multiplexer: A0_GND
+    gain: 6.144
+    id: soil_raw_voltage
+    name: "${friendly_name} Raw Voltage"
+    unit_of_measurement: "V"
+    update_interval: never
+    accuracy_decimals: 3
+
+  # 3. Ο ΤΕΛΙΚΟΣ, ΥΠΕΡΥΠΟΛΟΓΙΣΜΕΝΟΣ ΑΙΣΘΗΤΗΡΑΣ ΥΓΡΑΣΙΑΣ (Template)
+  - platform: template
+    name: "${friendly_name} Moisture"
+    id: final_moisture_percent
+    unit_of_measurement: "%"
+    device_class: moisture
+    state_class: measurement
+    update_interval: never # Ανανεώνεται μέσω του script παρακάτω
+    lambda: |-
+      float raw = id(soil_raw_voltage).state;
+      if (isnan(raw)) return {};
+      
+      float t = id(soil_temp).state;
+      if (isnan(t)) t = 25.0; // Αν χαλάσει το θερμόμετρο, θεωρούμε 25C
+      
+      // ==========================================
+      // TEMPERATURE COMPENSATION ALGORITHM
+      // Αντισταθμίζει -0.5% χωρητικότητας ανά 1C απόκλισης
+      // ==========================================
+      float comp_raw = raw * (1.0 + (25.0 - t) * 0.005);
+      
+      float dry = id(cal_dry);
+      float wet = id(cal_wet);
+      if (dry == wet) return 0.0; 
+      
+      // Μετατροπή σε ποσοστό %
+      float pct = (dry - comp_raw) / (dry - wet) * 100.0;
+      
+      if (pct < 0.0) pct = 0.0;
+      if (pct > 100.0) pct = 100.0;
+      return pct;
+
+# =====================================================
+# ΣΕΝΑΡΙΟ ΜΕΤΡΗΣΗΣ (Παίρνει μέτρηση κάθε 30 δευτερόλεπτα)
+# =====================================================
+interval:
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            script.is_running: run_calibration
+          then:
+            - delay: 0s # Αν τρέχει το calibration, μην παίρνεις ενδιάμεσες αυτόματες μετρήσεις
+          else:
+            - script.execute: measure_now
+
+script:
+  - id: measure_now
+    then:
+      - switch.turn_on: sensor_power_switch # 1. Δίνει ρεύμα
+      - delay: 2s                           # 2. Περιμένει 2 δευτερόλεπτα να σταθεροποιηθεί το ρεύμα
+      - component.update: soil_raw_voltage  # 3. Διαβάζει την ακριβής τάση από το ADS
+      - component.update: final_moisture_percent # 4. Εκτελεί τον αλγόριθμο υγρασίας
+      - switch.turn_off: sensor_power_switch # 5. Κλείνει το ρεύμα για μηδενική διάβρωση/κατανάλωση!
+
+  # =====================================================
+  # ΔΙΑΔΙΚΑΣΙΑ ΑΥΤΟΜΑΤΟΥ CALIBRATION ΜΕ TIMERS
+  # =====================================================
+  - id: run_calibration
+    mode: single
+    then:
+      - text_sensor.template.publish:
+          id: cal_status
+          state: "Βήμα 1: Αφήστε τον αισθητήρα στον ΑΕΡΑ (DRY)"
+      - delay: 10s
+      
+      - text_sensor.template.publish:
+          id: cal_status
+          state: "Μέτρηση DRY σε 10 δευτερόλεπτα..."
+      - delay: 5s
+      
+      - text_sensor.template.publish:
+          id: cal_status
+          state: "Μέτρηση DRY σε 5 δευτερόλεπτα..."
+      - delay: 5s
+      
+      - text_sensor.template.publish:
+          id: cal_status
+          state: "Γίνεται μέτρηση DRY..."
+      - switch.turn_on: sensor_power_switch
+      - delay: 2s
+      - component.update: soil_raw_voltage
+      - lambda: |-
+          id(cal_dry) = id(soil_raw_voltage).state;
+          ESP_LOGI("CALIBRATION", "Σώθηκε νέα τιμή DRY: %f", id(cal_dry));
+      - switch.turn_off: sensor_power_switch
+          
+      - text_sensor.template.publish:
+          id: cal_status
+          state: "Επιτυχία! Βήμα 2: Βάλτε τον αισθητήρα στο ΝΕΡΟ (WET)"
+      - delay: 10s
+      
+      - text_sensor.template.publish:
+          id: cal_status
+          state: "Μέτρηση WET σε 20 δευτερόλεπτα..."
+      - delay: 10s
+      
+      - text_sensor.template.publish:
+          id: cal_status
+          state: "Μέτρηση WET σε 10 δευτερόλεπτα..."
+      - delay: 5s
+      
+      - text_sensor.template.publish:
+          id: cal_status
+          state: "Μέτρηση WET σε 5 δευτερόλεπτα..."
+      - delay: 5s
+      
+      - text_sensor.template.publish:
+          id: cal_status
+          state: "Γίνεται μέτρηση WET..."
+      - switch.turn_on: sensor_power_switch
+      - delay: 2s
+      - component.update: soil_raw_voltage
+      - lambda: |-
+          id(cal_wet) = id(soil_raw_voltage).state;
+          ESP_LOGI("CALIBRATION", "Σώθηκε νέα τιμή WET: %f", id(cal_wet));
+      - switch.turn_off: sensor_power_switch
+          
+      - text_sensor.template.publish:
+          id: cal_status
+          state: "Επιτυχής Ολοκλήρωση Calibration!"
+      - delay: 5s
+      
+      - text_sensor.template.publish:
+          id: cal_status
+          state: "Αδράνεια (Idle)"
+
+# =====================================================
+# ΕΝΑΡΞΗ CALIBRATION ΑΠΟ ΤΟ ΚΟΥΜΠΙ BOOT (ΧΩΡΙΣ PC)
+# =====================================================
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: 0 # Το εσωτερικό κουμπί BOOT του ESPESP32
+      inverted: true
+      mode: INPUT_PULLUP
+    id: boot_button
+    internal: true
+    on_multi_click:
+      # ΔΙΠΛΟ ΚΛΙΚ (Ξεκινάει τη διαδικασία Calibration)
+      - timing:
+          - ON for at most 0.5s
+          - OFF for at most 0.5s
+          - ON for at most 0.5s
+          - OFF for at least 0.2s
+        then:
+          - script.execute: run_calibration
+
+# =====================================================
+# ΔΙΑΔΙΚΑΣΙΑ CALIBRATION ΑΠΟ ΤΟ HOME ASSISTANT
+# =====================================================
+text_sensor:
+  - platform: template
+    name: "${friendly_name} Calibration Status"
+    id: cal_status
+    icon: "mdi:information-outline"
+    entity_category: diagnostic
+
+button:
+  - platform: template
+    name: "${friendly_name} Start Calibration Sequence"
+    id: btn_start_cal
+    icon: "mdi:tools"
+    entity_category: config
+    on_press:
+      - script.execute: run_calibration
